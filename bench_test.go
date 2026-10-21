@@ -2,6 +2,7 @@ package zipcrypt
 
 import (
 	"archive/zip"
+	"bytes"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -27,5 +28,23 @@ func BenchmarkWrite(b *testing.B) {
 				w.Close()
 			}
 		})
+	}
+}
+
+// BenchmarkManySmallEntries writes 1000 small Deflate entries, where creating
+// a flate writer per entry dominates.
+func BenchmarkManySmallEntries(b *testing.B) {
+	data := bytes.Repeat([]byte("small file "), 100)
+	b.ReportAllocs()
+	for range b.N {
+		w := NewWriter(io.Discard)
+		for i := range 1000 {
+			fw, err := w.CreateWith(&zip.FileHeader{Name: fmt.Sprint(i), Method: zip.Deflate}, Options{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			fw.Write(data)
+		}
+		w.Close()
 	}
 }

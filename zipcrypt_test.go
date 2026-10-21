@@ -220,6 +220,38 @@ func TestPlainEntriesThroughEmbeddedWriter(t *testing.T) {
 	}
 }
 
+// flate writers come from a pool per level. Entries that mix levels and
+// methods must each start from a clean writer.
+func TestManyEntriesMixedLevels(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	opts := []Options{
+		{}, {NoCompression: true}, {Level: 9},
+		{Method: ZipCrypto, Password: "pw"}, {Method: ZipCrypto, Password: "pw", NoCompression: true},
+		{Method: AES256, Password: "pw"}, {Method: AES128, Password: "pw", Level: 1},
+	}
+	want := map[string][]byte{}
+	for i := range 60 {
+		name := fmt.Sprintf("f%02d.txt", i)
+		data := bytes.Repeat([]byte(fmt.Sprintf("entry %d ", i)), 200+i*31)
+		want[name] = data
+		fw, err := w.CreateWith(&zip.FileHeader{Name: name, Method: zip.Deflate}, opts[i%len(opts)])
+		if err != nil {
+			t.Fatal(err)
+		}
+		fw.Write(data)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range reader(t, buf.Bytes()).File {
+		got, err := readAll(f, "pw")
+		if err != nil || !bytes.Equal(got, want[f.Name]) {
+			t.Errorf("%s: err %v, equal %v", f.Name, err, bytes.Equal(got, want[f.Name]))
+		}
+	}
+}
+
 func TestOptionErrors(t *testing.T) {
 	w := NewWriter(io.Discard)
 	for _, tc := range []struct {
@@ -232,6 +264,7 @@ func TestOptionErrors(t *testing.T) {
 		{"password without encryption", zip.Deflate, Options{Password: "pw"}},
 		{"unknown encryption", zip.Deflate, Options{Method: AES256 + 1, Password: "pw"}},
 		{"unsupported compression", 12, Options{}}, // bzip2
+		{"invalid level", zip.Deflate, Options{Level: 10}},
 	} {
 		if _, err := w.CreateWith(&zip.FileHeader{Name: "a", Method: tc.method}, tc.opt); err == nil {
 			t.Errorf("%s: accepted", tc.name)

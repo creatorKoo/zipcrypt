@@ -22,6 +22,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Method selects how an entry is encrypted.
@@ -178,10 +179,10 @@ func (w *Writer) store(out io.Writer) (io.WriteCloser, error) {
 func (w *Writer) deflate(out io.Writer) (io.WriteCloser, error) {
 	p := w.next
 	if p == nil {
-		return flate.NewWriter(out, defaultLevel)
+		return newFlateWriter(out, defaultLevel)
 	}
 	if p.opt.Method != ZipCrypto {
-		return flate.NewWriter(out, p.opt.level())
+		return newFlateWriter(out, p.opt.level())
 	}
 	zc, err := newZipCryptoWriter(out, []byte(p.opt.Password), byte(p.fh.ModifiedTime>>8))
 	if err != nil {
@@ -209,16 +210,62 @@ func (w *Writer) aes(out io.Writer) (io.WriteCloser, error) {
 // compressor, so the last compressed block is encrypted before the
 // encryption trailer, if any, is written.
 type deflateThen struct {
-	fw   *flate.Writer
+	fw   io.WriteCloser
 	next io.WriteCloser
 }
 
 func newDeflateThen(next io.WriteCloser, level int) (*deflateThen, error) {
-	fw, err := flate.NewWriter(next, level)
+	fw, err := newFlateWriter(next, level)
 	if err != nil {
 		return nil, err
 	}
 	return &deflateThen{fw: fw, next: next}, nil
+}
+
+// flatePools holds flate writers by level, indexed from flate.HuffmanOnly.
+// Each one allocates close to 1 MB, so archives of many small files would
+// otherwise keep the garbage collector busy; archive/zip pools its default
+// compressor for the same reason.
+var flatePools [flate.BestCompression - flate.HuffmanOnly + 1]sync.Pool
+
+func newFlateWriter(w io.Writer, level int) (io.WriteCloser, error) {
+	if level < flate.HuffmanOnly || level > flate.BestCompression {
+		return nil, errors.New("zipcrypt: invalid compression level " + strconv.Itoa(level))
+	}
+	pool := &flatePools[level-flate.HuffmanOnly]
+	fw, ok := pool.Get().(*flate.Writer)
+	if ok {
+		fw.Reset(w)
+	} else {
+		var err error
+		if fw, err = flate.NewWriter(w, level); err != nil {
+			return nil, err
+		}
+	}
+	return &pooledFlate{fw: fw, pool: pool}, nil
+}
+
+// pooledFlate returns its flate writer to the pool on Close.
+type pooledFlate struct {
+	fw   *flate.Writer
+	pool *sync.Pool
+}
+
+func (p *pooledFlate) Write(b []byte) (int, error) {
+	if p.fw == nil {
+		return 0, errors.New("zipcrypt: write after close")
+	}
+	return p.fw.Write(b)
+}
+
+func (p *pooledFlate) Close() error {
+	if p.fw == nil {
+		return nil
+	}
+	err := p.fw.Close()
+	p.pool.Put(p.fw)
+	p.fw = nil
+	return err
 }
 
 func (d *deflateThen) Write(p []byte) (int, error) { return d.fw.Write(p) }
